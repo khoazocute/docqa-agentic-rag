@@ -107,6 +107,13 @@ def main(argv: list[str] | None = None) -> int:
     inj.add_argument("--delay", type=float, default=0.0, help="Seconds between calls (rate limits)")
     inj.add_argument("--out", type=Path, default=Path("eval/results"))
 
+    detector = sub.add_parser(
+        "injection-detector", help="Pattern detector recall/FPR on deepset/prompt-injections"
+    )
+    detector.add_argument(
+        "directory", type=Path, nargs="?", default=Path("data/benchmarks/deepset_injections")
+    )
+
     serve = sub.add_parser("serve", help="Run the REST API")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
@@ -125,6 +132,11 @@ def main(argv: list[str] | None = None) -> int:
         return _bench(args, parser)
     if args.command == "chunk-bench":
         return _chunk_bench(args)
+    if args.command == "injection-detector":
+        from docqa.injection_eval import evaluate_detector
+
+        _print(evaluate_detector(args.directory))
+        return 0
     if args.command == "injection-eval":
         return _injection_eval(args, parser)
 

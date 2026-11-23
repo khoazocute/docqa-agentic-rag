@@ -1,95 +1,149 @@
-# DocQA – Vietnamese Agentic RAG (Google ADK + LlamaIndex + Qdrant)
+# DocQA: Agentic RAG for Vietnamese documents
 
-An **agentic RAG** assistant that answers questions about internal documents (PDF, DOCX, Markdown, TXT) **in Vietnamese, with citations**, and says *"Tôi không tìm thấy thông tin này trong tài liệu đã cung cấp."* when the documents do not contain the answer.
+DocQA answers questions about a folder of documents (PDF, Word, Markdown, text) **in Vietnamese, with citations**, and says *"Tôi không tìm thấy thông tin này trong tài liệu đã cung cấp."* when the documents do not contain the answer.
 
-- **Agentic layer (Google ADK):** the agent plans sub-questions, searches for evidence, judges whether it is sufficient, re-searches (rephrased or within one document), reads neighbouring context, and verifies its own draft before answering. Every step is visible in the API response and the UI.
-- **Retrieval layer (LlamaIndex + Qdrant):** incremental ingestion, hybrid retrieval (dense vectors + BM25 fused with Reciprocal Rank Fusion), per-document filtering, versioned crash-safe index.
-- **Product layer:** FastAPI REST API, Streamlit chat UI, CLI, Docker Compose, GitHub Actions CI.
-- **Quality:** a labelled Vietnamese evaluation set (51 questions: single-hop, multi-hop and out-of-scope) and an evaluator that compares agentic RAG with one-shot RAG on accuracy, rejection, citations, **cost (LLM calls)** and latency.
+It is built with **LlamaIndex** (ingestion, indexing, retrieval), **Google ADK** (the agent) and **Qdrant** (vector store), and every design choice is backed by a measurement on public benchmarks or on labelled real documents.
 
-## Architecture
+## Highlights
+
+- **Structure-aware chunking** (headings, tables kept row by row, section path embedded with every chunk) raised retrieval **Hit@1 from 64% to 79%** on real Vietnamese documents.
+- **Hybrid retrieval** (BM25 + dense vectors, Reciprocal Rank Fusion) on a custom LlamaIndex retriever over Qdrant.
+- **Agentic RAG**: an ADK agent plans sub-questions, searches, re-searches and verifies its cited answer. LlamaIndex retrieval is exposed to it as tools.
+- **Grounded answers**: mandatory citations, a calibrated similarity gate, an LLM-as-judge check, and refusal when the documents are silent.
+- **Prompt-injection defence** in four layers, with the pattern detector measured on a third-party dataset rather than on its own attacks.
+- **Evaluation on public Vietnamese benchmarks**: Zalo AI 2021 Legal Text Retrieval (retrieval) and UIT-ViQuAD 2.0 (token-level chunking metrics).
+
+## Contents
+
+- [How it works](#how-it-works)
+- [Results](#results)
+- [Quickstart](#quickstart)
+- [Reproducing the evaluation](#reproducing-the-evaluation)
+- [Configuration](#configuration)
+- [API](#api)
+- [Development](#development)
+- [Limitations](#limitations)
+
+## How it works
 
 ```mermaid
 flowchart LR
-    U[User] --> UI[Streamlit UI]
-    U --> ADKWEB[adk web / adk run]
-    UI -->|/chat| API[FastAPI]
-    UI -->|/query| API
-    API --> CHAT[ChatService<br/>ADK Runner, sessions,<br/>LLM-call limit, citations]
-    ADKWEB --> AGENT
-    CHAT --> AGENT[ADK agent<br/>plan → search → judge →<br/>re-search → verify]
-    AGENT -->|search_passages| ENGINE
-    AGENT -->|read_context| ENGINE
-    AGENT -->|check_answer| ENGINE
-    AGENT -->|list / sync documents| ENGINE
-    API -->|query, upload, sync| ENGINE[DocQAEngine]
-    subgraph RAG[LlamaIndex retrieval]
-      ENGINE --> RET[HybridRetriever<br/>optional document filter]
-      RET --> VEC[Vector search<br/>Gemini embeddings]
-      RET --> BM25[BM25]
-      RET --> RRF[RRF fusion]
-      VEC --> QD[(Qdrant)]
+    subgraph Ingestion
+      F[PDF / DOCX / MD / TXT] --> P[Parse: headings, tables,<br/>image descriptions]
+      P --> C[Chunk: by section,<br/>semantic if no structure]
+      C --> E[Embed: Gemini] --> Q[(Qdrant<br/>versioned index)]
+      C --> B[(BM25)]
     end
-    ENGINE --> STORE[(Versioned index<br/>storage/versions/*)]
-    DATA[(data/)] -->|incremental sync| ENGINE
+    subgraph Query
+      U[User] --> API[FastAPI / Streamlit / CLI]
+      API -->|/query| R[Hybrid retriever<br/>BM25 + vector + RRF]
+      API -->|/chat| A[ADK agent<br/>plan → search → verify]
+      A -->|tools| R
+      R --> Q
+      R --> B
+      R --> G[Grounded answer<br/>citations, refusal, guards]
+      A --> G
+    end
 ```
 
-### Agentic RAG loop (`POST /chat`, `adk web`)
+**How LlamaIndex and Google ADK fit together.** LlamaIndex owns the data path: parsing, chunking, the `VectorStoreIndex` on Qdrant, and a custom `HybridRetriever` (a LlamaIndex `BaseRetriever`). The ADK agent never touches the index directly: it calls thin Python tools (`search_passages`, `read_context`, `check_answer`) that return **evidence passages with ids**, and the agent reasons over them and cites them. The one-shot endpoint `/query` uses the same engine without the agent, as a cheaper baseline.
 
-```text
-question ─► plan: rewrite follow-ups, split multi-part questions into sub-questions
-          ─► for each sub-question:
-               search_passages(query[, document]) ─► evidence passages with ids
-               judge: enough to answer?
-                 no ─► rephrase / restrict to one document / read_context(passage_id) ─► search again (≤ 3)
-          ─► draft answer citing passages as [#id]
-          ─► check_answer(draft): cited ids must exist; an LLM judge flags unsupported claims
-          ─► revise, reply; the chat layer renumbers [#id] → [1], [2] and returns the steps taken
-```
+| Stage | What happens | Code |
+|---|---|---|
+| Parsing | Word heading styles, Markdown `#` and numbered headings (`2.1`, `Chương II`, `Điều 5`) become sections; tables become one `header: value` line per row; images are described by Gemini vision (optional) | `structure.py`, `images.py` |
+| Chunking | One chunk set per section with its heading path; semantic chunking (sentence-window cosine breakpoints) for files without structure | `structure.py`, `semantic.py` |
+| Indexing | Incremental sync by content hash; every write creates a new index version and switches an atomic `CURRENT` pointer; quota-aware embedding | `engine.py`, `storage.py` |
+| Retrieval | BM25 + vector, fused with RRF, optional per-document filter | `retrieval.py` |
+| Generation | Numbered excerpts, mandatory `[n]` citations, similarity gate, refusal detection | `prompts.py`, `engine.py` |
+| Agent | Plan, search (≤ 3 per sub-question), read neighbouring chunks, draft with `[#id]`, verify once, answer; LLM-call limit and citation checks enforced in code | `agent.py`, `chat.py` |
+| Security | Spotlighting, output guard, tool permission, sanitisation (`INJECTION_DEFENSE`) | `injection.py` |
 
-Guardrails: the tools return **evidence, never answers**; citations to passages the agent never retrieved are dropped; a per-turn LLM-call limit (`AGENT_MAX_LLM_CALLS`) stops runaway loops; refusals happen only after a search returns nothing.
+Design rationale for each decision, including what did not work: [docs/design-decisions.md](docs/design-decisions.md). Layer-by-layer detail: [docs/architecture.md](docs/architecture.md).
 
-### One-shot RAG (`POST /query`, CLI `docqa ask`)
+## Results
 
-Kept as a cheaper baseline (one retrieval, one LLM call) and for comparison in the evaluation:
+All numbers below come from runs in this repository. Commands to reproduce them are in [Reproducing the evaluation](#reproducing-the-evaluation).
 
-1. Retrieve `CANDIDATE_TOP_K` chunks with the vector retriever and with BM25, fuse them with RRF and keep `TOP_K`.
-2. If the best cosine similarity is below `MIN_SIMILARITY`, return `not_found` **without calling the LLM**.
-3. Otherwise prompt the LLM with numbered excerpts. The prompt forbids outside knowledge, requires `[n]` citations and treats excerpts as data (prompt-injection guard).
-4. Post-process: detect refusals, map `[n]` back to sources and report latency per stage.
+### 1. Chunking on real documents
 
-More detail: [docs/architecture.md](docs/architecture.md) and [docs/design-decisions.md](docs/design-decisions.md).
+Public benchmarks ship text that is already split into passages, so they cannot test parsing, tables or figures. This set has 56 answerable questions over a 30-page Vietnamese `.docx` (46 headings, 12 tables) and a 49-slide `.pdf`. Each question is tagged by where its answer lives, and all of them were written **before** the new chunker existed. The set is not committed, because the documents are private or third-party. Hybrid retrieval, top 5:
 
-## Features
+| Answer located in | n | Hit@1, sentence → structure | MRR@5, sentence → structure |
+|---|---|---|---|
+| body text | 30 | 80.0% → **90.0%** | 0.883 → **0.939** |
+| a table | 12 | 66.7% → **83.3%** | 0.750 → **0.917** |
+| a named section | 7 | 57.1% → **100%** | 0.671 → **1.000** |
+| a figure only | 7 | 0% → 0% | 0 → 0 |
+| **all** | 56 | **64.3% → 78.6%** | **0.718 → 0.824** |
 
-| Area | What is implemented |
-|---|---|
-| Ingestion | `.pdf` `.docx` `.md` `.txt`, recursive folders, stable document ids (`path::part`), content hashing |
-| Incremental sync | Only new or changed files are embedded; deleted files are removed; unreadable files are reported and keep their previous version |
-| Safe persistence | Each write creates a new index version and `CURRENT` is switched atomically; a failed rebuild never breaks the serving index; other processes hot-reload the new version |
-| Config-aware index | Changing the embedding model or chunking triggers an automatic rebuild (index fingerprint) |
-| Structure-aware chunking | `CHUNK_STRATEGY=structure`: Word heading styles, Markdown `#` and numbered headings (`2.1`, `Chương II`, `Điều 5`) split documents into sections; tables become one `header: value` line per row (merged cells handled), captioned tables are their own chunks; the heading path is embedded and indexed with every chunk and shown in citations; documents without structure (notes, transcripts, slide decks) use **semantic chunking** instead (`STRUCTURE_FALLBACK`) |
-| Semantic chunking | Kamradt-style percentile breakpoints on the cosine distance between consecutive sentence windows; PDF line breaks re-joined and list items kept as sentences before splitting; oversized groups re-split and tiny ones merged within the chunk size; embeddings go through the quota-aware path. Available alone (`CHUNK_STRATEGY=semantic`) for comparison, but used by default only where there is no structure: on the eval corpus that costs 132 extra embeddings instead of 1,117 |
-| Image understanding | `IMAGE_CAPTIONS=true`: images in PDFs and Word figures are described once by the multimodal LLM (visible text transcribed verbatim, then explained) and inserted where the image was, so image-only slides and diagrams become searchable and citable by page or section. Decorations are filtered before any call (images repeated on several pages, icons), the model flags decorative images, descriptions are cached on disk by image hash, a per-file budget caps calls, and quota errors never fail ingestion |
-| Retrieval | `vector`, `bm25` or `hybrid` (RRF, with each retriever's #1 guaranteed a slot) modes; Vietnamese stop words, no English stemming; short pages merged to avoid noise chunks |
-| Vector stores | `simple` (LlamaIndex JSON, zero setup) or `qdrant`: server mode via `QDRANT_URL` (Docker Compose) or embedded mode; one collection per index version, orphan collections cleaned up, missing collection triggers a rebuild |
-| Models | Google Gemini (default) or fully local Ollama for the LLM and embeddings |
-| Grounding | Similarity gate, strict prompt, refusal detection, citation extraction |
-| Agentic RAG | ADK agent with `search_passages` (optional per-document filter), `read_context`, `check_answer`, `list_documents`, `sync_documents`; multi-step plan / judge / re-search / verify loop; passage citations renumbered for display; per-turn LLM-call limit; full rebuild is **not** exposed to the LLM |
-| API | `/query`, `/chat` (multi-turn), `/documents` upload/list/delete, `/index/sync`, `/index/rebuild`, `/stats`, `/health`; optional `X-API-Key` for write endpoints; upload type, size and path-traversal checks |
-| Tooling | CLI, Streamlit UI, Docker Compose, CI (ruff + pytest on Python 3.12/3.13 + Docker build) |
-| Quota handling | Embeddings are sent in batches; per-minute 429s are waited out using the provider's `retry in …` hint, while daily-quota errors fail fast with a clear error |
-| Tests | 152 offline tests with deterministic fake embeddings/LLM, including the real ADK runtime driven by a scripted model |
+Every miss of the old chunker came from lost structure: a list cut off from its heading, a table without its caption, table cells detached from their columns. Figures stay at 0% because their text is never extracted; image descriptions (`IMAGE_CAPTIONS`) address that, and their effect has not been measured yet.
+
+### 2. Chunk size and boundaries at token level (UIT-ViQuAD 2.0)
+
+Hit@k does not penalise irrelevant text inside a chunk, so chunking is also measured token by token against human-labelled answer sentences, using the metrics of Chroma's *Evaluating Chunking Strategies for Retrieval* (2024). Data: 2,653 answerable questions of the UIT-ViQuAD 2.0 validation split, with the 19 Wikipedia articles rebuilt from their paragraphs. Retrieval is BM25, top 5. Precision Ω is the precision obtained when exactly the chunks that contain the answer are retrieved, so it measures the chunk boundaries independently of the retriever.
+
+| Chunking | Tokens / chunk | Precision Ω | Recall@5 | IoU@5 |
+|---|---|---|---|---|
+| **paragraph boundaries** | 365 | **0.222** | **0.918** | 0.038 |
+| sentence splitter 256 / overlap 0 | 212 | 0.360 | 0.858 | 0.062 |
+| sentence splitter 512 / overlap 0 | 459 | 0.167 | 0.901 | 0.030 |
+| sentence splitter 512 / overlap 64 | 457 | 0.165 | 0.909 | 0.030 |
+| sentence splitter 512 / overlap 128 | 459 | 0.152 | 0.910 | 0.030 |
+| sentence splitter 1024 / overlap 0 | 929 | 0.083 | 0.924 | 0.015 |
+
+- **Natural boundaries beat fixed-size chunks on both axes.** Paragraph chunks are smaller than 512-token chunks, yet have higher recall and higher precision. This is the idea behind structure-aware chunking, confirmed on public data.
+- **Overlap barely helps.** 512/128 creates 22% more chunks than 512/0 for +0.9 points of recall, and lowers precision.
+- Wikipedia articles here have paragraphs but no headings, so this benchmark cannot test heading-based chunking; set 1 does.
+
+### 3. Retrieval on Zalo AI 2021 Legal Text Retrieval
+
+61,425 legal articles and 788 human-labelled test questions, in BEIR format. Each article is one passage, so this measures retrieval, not chunking. Values are means with 95% bootstrap confidence intervals.
+
+| Retriever | nDCG@10 | MRR@10 | Recall@1 | Recall@10 | Recall@100 |
+|---|---|---|---|---|---|
+| BM25, full corpus | 0.628 [0.602–0.654] | 0.562 | 0.417 | 0.834 | 0.968 |
+
+Dense and hybrid retrieval need one embedding per article, so they run on a seeded subset (all relevant articles of 100 sampled questions plus 1,500 random distractors). These results are pending. Subset scores are only compared with each other, never with full-corpus numbers.
+
+### 4. Agentic vs one-shot RAG
+
+Demo corpus (12 chunks), Gemini `gemini-3.5-flash-lite`. The sample is small, so these are observations, not significant differences.
+
+| Questions | One-shot RAG | Agentic RAG |
+|---|---|---|
+| 10 multi-hop, top-k 4 | 100%, 0.9 LLM calls, 4.3 s | 100%, 4.1 LLM calls, 23 s |
+| 10 multi-hop, top-k 2 (narrow retrieval) | 90%, 1.0 LLM calls, 1.5 s | **100%**, 3.5 LLM calls, 17 s |
+| 7 out-of-scope | 100% correct refusal | 100% correct refusal |
+
+The agent costs about 4× the LLM calls. It pays off only when a single retrieval cannot see all the evidence, so one-shot RAG (`/query`) is the default and the agent (`/chat`) serves conversation and multi-part questions.
+
+### 5. Prompt injection
+
+| Layer | Protects against | Setting |
+|---|---|---|
+| Spotlighting: excerpts wrapped in tags with a random per-request nonce, declared as data only | Instructions hidden in documents | `spotlight`, `full` |
+| Output guard: links not present in the excerpts are removed; answers that reproduce the system prompt are withheld | Phishing links, prompt extraction | `spotlight`, `full` |
+| Tool permission: `sync_documents` runs only if the user's own message asks for it (checked in code) | Tool hijacking | `spotlight`, `full` |
+| Sanitisation: sentences addressing the AI or overriding it are replaced before the model sees them | Known injection phrasings (vi, en) | `full` |
+
+The pattern detector is measured on data it was not developed on:
+
+| Data | Detection rate | False positives |
+|---|---|---|
+| [deepset/prompt-injections](https://huggingface.co/datasets/deepset/prompt-injections), held-out test split (60 attacks, 56 benign) | 26.7% | 0% |
+| 718,149 clean Vietnamese sentences (legal texts, Wikipedia, company documents) | – | 0.0003% |
+
+The detector is precise but catches only about a quarter of unseen attacks. That is why the three structural layers, which do not need to recognise an attack, carry most of the defence. End-to-end attack success rates on a focused 30-case suite adapted from BIPIA and AgentDojo (six payload types: instruction override, phishing link, false claim, prompt extraction, tool hijacking, denial of service) are pending.
 
 ## Quickstart
 
-Requirements: Python 3.11+ and a Gemini API key ([Google AI Studio](https://aistudio.google.com/app/apikey)), or [Ollama](https://ollama.com) for a fully local setup.
+Requirements: Python 3.11+ and a Gemini API key from [Google AI Studio](https://aistudio.google.com/app/apikey), or [Ollama](https://ollama.com) for local models.
 
 ```bash
 python -m venv .venv
 # Windows: .venv\Scripts\activate    Linux/macOS: source .venv/bin/activate
-pip install -e ".[dev,ui,qdrant]"    # add ,ollama for local models
-cp .env.example .env                 # then set GOOGLE_API_KEY
+pip install -e ".[dev,ui,qdrant]"     # add ,ollama for local models
+cp .env.example .env                  # set GOOGLE_API_KEY; CHUNK_STRATEGY=structure is recommended
 ```
 
 Index the demo documents (a fictional company in `data/demo/`) and ask a question:
@@ -106,285 +160,125 @@ docqa ask "Định mức khách sạn khi công tác ở TP.HCM là bao nhiêu?"
 
 *(Illustrative output: the wording depends on the model.)*
 
-### Run the chat UI
+Other ways to run it:
 
-```bash
-docqa serve                              # REST API at http://127.0.0.1:8000 (docs at /docs)
-streamlit run ui/streamlit_app.py        # UI at http://localhost:8501
-```
+| Interface | Command |
+|---|---|
+| REST API (docs at `/docs`) | `docqa serve` → http://127.0.0.1:8000 |
+| Chat UI | `streamlit run ui/streamlit_app.py` → http://localhost:8501 (needs the API) |
+| ADK developer UI | `adk web agents`, then pick `docqa_agent` |
+| Docker Compose (Qdrant, API, UI) | `docker compose up --build` |
 
-### Run with the ADK developer UI or CLI
+**Local models.** Set `LLM_PROVIDER=ollama`, `LLM_MODEL=qwen2.5:7b`, `EMBED_PROVIDER=ollama` and `EMBED_MODEL=embeddinggemma` after `ollama pull` of both models. `/query` and `docqa ask` then run fully locally; the ADK agent still uses `ADK_MODEL` (Gemini).
 
-```bash
-adk web agents                 # pick "docqa_agent"
-adk run agents/docqa_agent
-```
-
-### Run with Docker
-
-```bash
-docker compose up --build      # Qdrant on :6333, API on :8000, UI on :8501; reads .env
-```
-
-### Fully local with Ollama
-
-```bash
-ollama pull qwen2.5:7b && ollama pull embeddinggemma
-# .env
-LLM_PROVIDER=ollama
-LLM_MODEL=qwen2.5:7b
-EMBED_PROVIDER=ollama
-EMBED_MODEL=embeddinggemma
-```
-
-The ADK agent itself still uses `ADK_MODEL` (Gemini). `docqa ask`, `/query` and the "RAG trực tiếp" mode of the UI run fully locally.
-
-## Example questions
+**Example questions on the demo data**
 
 | Question | Expected behaviour |
 |---|---|
-| Sinh viên thực tập từ mấy giờ đến mấy giờ? | Mon–Fri, 8:30–17:30 `[n]` |
-| Ngày phép chưa dùng hết có được chuyển sang năm sau không? | Up to 5 days, must be used before 31/03 `[n]` |
-| Phụ cấp trực hệ thống mỗi tuần là bao nhiêu? | 1.000.000 đồng per on-call week (answer comes from the **.docx** file) |
-| *(agent, follow-up)* "Còn sự cố P1 thì phải xác nhận trong bao lâu?" | Agent rewrites into a standalone query → 15 minutes |
-| Tài liệu có nói về lương thực tập không? | `not_found` |
-| Thủ đô của nước Pháp là gì? | `not_found` (out of scope) |
+| Sinh viên thực tập từ mấy giờ đến mấy giờ? | Mon–Fri, 8:30–17:30, with a citation |
+| Phụ cấp trực hệ thống mỗi tuần là bao nhiêu? | 1,000,000 VND per on-call week, answered from the `.docx` file |
+| *(agent, follow-up)* Còn sự cố P1 thì phải xác nhận trong bao lâu? | The agent rewrites it as a standalone question → 15 minutes |
+| Thủ đô của nước Pháp là gì? | Refusal: out of scope |
 
-## Evaluation
+## Reproducing the evaluation
 
-Evaluation has three layers, because no public benchmark covers every part of the system:
+```bash
+python scripts/download_benchmarks.py            # Zalo Legal, UIT-ViQuAD 2.0, deepset injections → data/benchmarks/
+```
 
-| Layer | Data | Metrics |
+| Result | Command | API cost |
 |---|---|---|
-| Retrieval | **Zalo AI 2021 Legal Text Retrieval** (public, human-labelled; BEIR format) | nDCG@10, MRR@10, Recall@k, with 95% bootstrap CIs |
-| Answers and refusal | UIT-ViQuAD 2.0 in an open-domain setting (in progress) | EM/F1, correct-refusal rate |
-| Document processing (tables, sections, figures, Word/PDF) | Own tagged set, because public benchmarks ship pre-segmented text | Hit@1, Hit@k, MRR per question type |
+| 1. Chunking on real documents | `CHUNK_STRATEGY=structure docqa eval --dataset <set>.jsonl --retrieval-only --k 5` | Embeddings |
+| 2. Token-level chunking | `docqa chunk-bench data/benchmarks/viquad2/data/validation-00000-of-00001.parquet` | None |
+| 3. Zalo Legal, BM25 full corpus | `docqa bench data/benchmarks/zalo_legal --modes bm25` | None |
+| 3. Zalo Legal, dense and hybrid | `docqa bench data/benchmarks/zalo_legal --modes bm25,vector,hybrid --queries 100 --distractors 1500` | ~1,600 embeddings, cached on disk |
+| 4. Agentic vs one-shot | `docqa eval --agent --kinds multi_hop,unanswerable --delay 4` | LLM calls |
+| 5. Injection detector | `docqa injection-detector` | None |
+| 5. Attack success rate | `docqa injection-eval --modes oneshot,agent --defenses off,spotlight,full --delay 4` | LLM calls |
 
-### Public benchmark: Zalo AI 2021 Legal Text Retrieval
+`docqa eval` uses the labelled demo set [eval/dataset.jsonl](eval/dataset.jsonl) by default: 34 single-hop, 10 multi-hop and 7 out-of-scope questions. It reports Hit@k and MRR per retrieval mode and per question tag; answer accuracy, refusal and citation rates; LLM-as-judge faithfulness; cost (LLM calls) and latency, for one-shot RAG and the agent side by side; and a suggested `MIN_SIMILARITY` from the score distributions. Reports are written to `eval/results/`.
 
-```bash
-# Data: https://huggingface.co/datasets/GreenNode/zalo-ai-legal-text-retrieval-vn (MIT), into data/benchmarks/zalo_legal
-docqa bench data/benchmarks/zalo_legal --modes bm25                       # full corpus, no API cost
-docqa bench data/benchmarks/zalo_legal --modes bm25,vector,hybrid \
-            --queries 100 --distractors 1500 --seed 42                    # reproducible subset for dense retrieval
-```
-
-Each legal article is one passage, as in BEIR, so these numbers measure retrieval, not chunking. Full corpus: 61,425 articles, 788 labelled test queries.
-
-| Retriever | nDCG@10 | MRR@10 | Recall@1 | Recall@5 | Recall@10 | Recall@100 |
-|---|---|---|---|---|---|---|
-| BM25 (syllables, Vietnamese stop-words) | 0.628 [0.602–0.654] | 0.562 | 0.417 | 0.757 | 0.834 | 0.968 |
-
-Dense and hybrid retrieval need one embedding per passage, so they are evaluated on a seeded subset: all relevant articles of the sampled queries plus random distractors. Subset scores compare our own configurations and are not comparable with full-corpus results. Passage embeddings are cached on disk, so a run interrupted by a daily quota resumes without re-embedding.
-
-### Public benchmark: chunking measured at token level (UIT-ViQuAD 2.0)
-
-Hit@k does not penalise irrelevant text inside a chunk. Following Chroma's *Evaluating Chunking Strategies for Retrieval* (2024), chunking is also measured token by token against human-labelled spans. Data: the UIT-ViQuAD 2.0 validation split (VLSP 2021; mirror `taidng/UIT-ViQuAD2.0`; the test split has no public answers). The 19 Wikipedia articles are rebuilt from their paragraphs, and the ground-truth excerpt of each of the 2,653 answerable questions is the sentence containing its annotated answer.
-
-```bash
-docqa chunk-bench data/benchmarks/viquad2/data/validation-00000-of-00001.parquet
-```
-
-| Chunking | Chunks | Tokens/chunk | Precision Ω | Recall@5 (BM25) | IoU@5 |
-|---|---|---|---|---|---|
-| **paragraph boundaries** | 557 | 365 | **0.222** | **0.918** | 0.038 |
-| sentence 128 / overlap 0 | 2,121 | 96 | 0.705 | 0.767 | 0.117 |
-| sentence 256 / 0 | 961 | 212 | 0.360 | 0.858 | 0.062 |
-| sentence 256 / 64 | 1,086 | 211 | 0.345 | 0.866 | 0.062 |
-| sentence 512 / 0 | 443 | 459 | 0.167 | 0.901 | 0.030 |
-| sentence 512 / 64 (previous default) | 468 | 457 | 0.165 | 0.909 | 0.030 |
-| sentence 512 / 128 | 539 | 459 | 0.152 | 0.910 | 0.030 |
-| sentence 1024 / 0 | 219 | 929 | 0.083 | 0.924 | 0.015 |
-
-- **Natural boundaries beat fixed-size splitting on both axes.** Paragraph chunks are smaller than 512-token chunks yet have higher recall (0.918 vs 0.909) and higher Precision Ω (0.222 vs 0.165). This is public-data evidence for splitting on the document's own boundaries, the idea behind structure-aware chunking.
-- **Overlap barely helps.** Going from 512/0 to 512/128 adds 22% more chunks for +0.9 points of recall and lowers Precision Ω, consistent with Chroma's findings.
-- **Size is a trade-off, not an optimum.** Small chunks maximise precision and IoU, large ones maximise recall. IoU is read together with recall and answer quality, because tiny chunks starve the LLM of context.
-- Wikipedia text has paragraphs but no headings, so this benchmark cannot compare heading-based structure-aware chunking; the own evaluation set below covers that, plus tables, figures and Word/PDF parsing.
-
-### Own evaluation set
-
-```bash
-docqa eval                                  # retrieval for vector/bm25/hybrid + answers + calibration
-docqa eval --retrieval-only                 # embeddings only, no LLM cost
-docqa eval --judge                          # + LLM-as-judge faithfulness
-docqa eval --agent --kinds multi_hop,unanswerable --delay 4   # agentic vs one-shot RAG
-```
-
-The dataset [eval/dataset.jsonl](eval/dataset.jsonl) has 51 questions:
-- 34 **single-hop** questions, each with the expected source file, the evidence phrase the retrieved chunk must contain, and the answer keywords.
-- 10 **multi-hop** questions that need facts from two documents, or from different sections of one document.
-- 7 **unanswerable** questions.
-
-Reports are written to `eval/results/eval-<timestamp>.md|json`, with:
-
-- **Retrieval**: Hit@k and MRR@k per mode, plus the list of missed questions.
-- **Answers**, for one-shot RAG and (with `--agent`) agentic RAG side by side: accuracy overall and per question kind, correct-rejection rate, false-rejection rate, citation rate, faithfulness, p50/p95 latency and **cost**: LLM calls and searches per question, and how often the agent verified its answer.
-- **Similarity calibration**: score distributions of answerable vs. unanswerable questions and a suggested `MIN_SIMILARITY`. The scale depends on the embedding model (Qdrant and the `simple` store both report cosine similarity), so calibrate after changing it.
-
-### Results: structure-aware chunking on a hard corpus
-
-The demo corpus is too easy to compare chunking strategies (Hit@4 is already 100%). A second, private eval set (`eval/private/`, not committed because it uses a private thesis proposal and third-party lecture slides) has 56 answerable and 6 unanswerable questions over a 30-page Vietnamese `.docx` (46 headings, 12 tables) and a 49-slide RAG lecture `.pdf`. Each question is tagged by where its answer lives, and the set was written and validated **before** the new chunker existed. Hybrid retrieval, top-5:
-
-| Question tag | n | Hit@1 sentence → structure | Hit@5 sentence → structure | MRR@5 sentence → structure |
-|---|---|---|---|---|
-| text | 30 | 80.0% → **90.0%** | 100% → 100% | 88.3% → **93.9%** |
-| table | 12 | 66.7% → **83.3%** | 91.7% → **100%** | 75.0% → **91.7%** |
-| section (question names a heading) | 7 | 57.1% → **100%** | 85.7% → **100%** | 67.1% → **100%** |
-| image (answer only inside a figure) | 7 | 0% → 0% | 0% → 0% | 0% → 0% |
-| **all** | 56 | 64.3% → **78.6%** | 83.9% → **87.5%** | 71.8% → **82.4%** |
-
-- Every miss of the old chunker was caused by lost structure: a list separated from its heading ("Must-have"), a table without its caption, table cells detached from their row and column, a database-schema chunk without its section, so lecture slides about "embeddings" outranked it.
-- Vector-only retrieval gained the most (Hit@1 53.6% → 71.4%): the heading path gives the embedding the context the chunk text lacks.
-- Cost: 133 chunks instead of 102 (+30% embeddings), because sections are shorter than 512 tokens.
-- Inspecting the output before measuring caught a bug the metrics would have missed: merged-cell de-duplication by *text* dropped one of two adjacent "Có" cells and shifted every following column. Cells are now de-duplicated by XML element.
-- Regression check on the easy demo corpus (BM25-only, measured offline): Hit@4 unchanged at 100%, Hit@1 100% → 97.1% (one genuinely ambiguous question, not tuned away). The hybrid check is pending; `sentence` stays the default until it passes.
-- **Images are the next gap**: no chunker can retrieve text that was never extracted. Image-only slides and figures need captioning at ingestion.
-
-### Results (retrieval, `gemini-embedding-2`, chunk size 512)
-
-Demo corpus: 6 documents → 12 chunks; 34 answerable questions.
-
-| Mode | Hit@1 | Hit@4 | MRR@4 |
-|---|---|---|---|
-| vector | 91.2% | 97.1% | 94.1% |
-| bm25 | **97.1%** | **100%** | **98.5%** |
-| hybrid (RRF) | 94.1% | 100% | 96.6% |
-
-Findings:
-
-- **BM25 beats dense retrieval on this corpus.** Policy questions hinge on exact tokens (amounts, durations such as "5 phút" or "24 giờ"), which keyword matching handles better than embeddings. Plain RRF gives both retrievers equal weight, so hybrid inherits some vector mistakes at rank 1. The next experiment is a weighted fusion and/or a reranker.
-- **The similarity gate is only a cost filter.** Best-match cosine scores overlap between answerable (min 0.574) and unanswerable questions (max 0.668), so no threshold separates them cleanly. `MIN_SIMILARITY=0.55` never rejects an answerable question, and the LLM's grounded refusal is the real safeguard.
-- **Caveat:** with only 12 chunks, Hit@4 retrieves a third of the corpus, so Hit@1 and MRR are the informative metrics. A larger corpus is needed for stronger claims.
-
-### Results: agentic vs one-shot RAG (Gemini `gemini-3.5-flash-lite`, Qdrant)
-
-| Experiment | System | Accuracy | LLM calls / question | Latency p50 |
-|---|---|---|---|---|
-| 10 multi-hop, `TOP_K=4` | one-shot RAG | 100% | 0.94 | 4.3 s |
-| | agentic RAG | 100% (8/8, 2 API 503 errors) | 4.1 | 23.3 s |
-| 10 multi-hop, `TOP_K=2` | one-shot RAG | 90% | 1.0 | 1.5 s |
-| | agentic RAG | **100%** | 3.5 | 17.0 s |
-| 7 unanswerable, `TOP_K=4` | one-shot RAG | 100% correct rejection | 0.86 | 1.8 s |
-| | agentic RAG | 100% (6/6, 1 API 503 error); 71% before the fixes below | 4.3 | 18.3 s |
-
-What the numbers say:
-
-- **On this small corpus the agent rarely adds accuracy.** With 12 chunks, a single top-4 retrieval already covers both documents of most multi-hop questions. The agent costs about 4× the LLM calls and 5–10× the latency.
-- **It helps when one retrieval cannot see everything.** With `TOP_K=2`, as in a large corpus where top-k covers little, one-shot RAG answered *"Can employees on probation work remotely?"* with "not mentioned". The agent split the question, searched for the remote-work rule separately, found "only staff who have passed probation", and answered correctly. This is one question out of ten, so it is an illustration, not a statistically significant result.
-- **The first agent run exposed two problems, both fixed with regression tests.** The agent wrote grouped citations (`[#a, #b, #c]`) that leaked raw ids into the answer. It also paraphrased refusals instead of using the standard sentence. The fix adds group parsing and a grounding guardrail: an answer given after a search with no valid citation becomes the standard refusal.
-- **A live test found a verification loop**: the agent re-checked its answer 8 times. The "check once" rule is now enforced in code, and the judge accepts direct logical consequences. See design decision 12.
-- **Recommendation:** use `/query` (one-shot) by default. Use the agent (`/chat`) for conversation, multi-part questions and larger corpora, where its cost buys accuracy.
-
-Remaining single-hop answer metrics need ~34 more LLM calls: `docqa eval --kinds single --delay 4`.
-
-## Security: indirect prompt injection
-
-A document that says "ignore your instructions and …" ends up in the model's context like any other excerpt, and with an agent it can also try to trigger tools. `INJECTION_DEFENSE` adds four independent layers, none of which costs an extra model call:
-
-| Layer | What it does | Level |
-|---|---|---|
-| Spotlighting (Microsoft, 2024) | Excerpts are wrapped in tags with a random per-request nonce; the prompt says tagged text is data only, and forged closing tags are stripped | `spotlight`, `full` |
-| Output guard | Links absent from the excerpts are removed; an answer that reproduces the system instructions is withheld | `spotlight`, `full` |
-| Tool permission | `sync_documents` (state-changing) runs only when the user's own message asks for it, checked in code from ADK's `user_content` | `spotlight`, `full` |
-| Sanitisation | Sentences that address the AI or try to override it (Vietnamese and English pattern families: override, context reset, document bypass, role tags, prompt extraction, tool calls, role play) are replaced with a placeholder before the model sees them | `full` |
-
-**The pattern layer is measured on data it was not written for**, because detection rates on one's own attacks are optimistic:
-
-| Data | Detection (recall) | False positives |
-|---|---|---|
-| [deepset/prompt-injections](https://huggingface.co/datasets/deepset/prompt-injections) test split (60 injections, 56 benign; held out while developing) | **26.7%** | **0%** |
-| 718,149 sentences of clean Vietnamese text (Zalo Legal 61k articles, ViQuAD, demo and private corpora) | – | **0.0003%** (2 sentences) |
-
-The first version flagged ordinary Vietnamese ("đóng vai trò", "sử dụng công cụ hỗ trợ", "ai phải nộp thuế") and caught 1.7% of the held-out injections. It is now very precise but catches only about a quarter of unseen attacks, so the structural layers (spotlighting, output guard, tool permission), which do not depend on recognising the attack, carry most of the defence.
-
-End-to-end attack success rate is measured with a 30-case indirect-injection suite (6 payload types following BIPIA and AgentDojo: instruction override, phishing link, false claim, prompt extraction, tool hijacking, denial of service; 5 placements and disguises each), comparing `off`, `spotlight` and `full` for one-shot RAG and the agent, together with accuracy under attack and on clean documents:
-
-```bash
-docqa injection-eval --modes oneshot,agent --defenses off,spotlight,full --delay 4
-```
+Datasets: [Zalo Legal (MIT)](https://huggingface.co/datasets/GreenNode/zalo-ai-legal-text-retrieval-vn); [UIT-ViQuAD 2.0 mirror](https://huggingface.co/datasets/taidng/UIT-ViQuAD2.0) of the VLSP 2021 dataset (the official release is available from the UIT NLP group); [deepset/prompt-injections (Apache-2.0)](https://huggingface.co/datasets/deepset/prompt-injections). They are downloaded locally and are not redistributed in this repository.
 
 ## Configuration
 
-All settings come from environment variables or `.env` (see [.env.example](.env.example)).
+All settings come from environment variables or `.env`; see [.env.example](.env.example).
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ADK_MODEL` | `gemini-3.5-flash-lite` | Model for the ADK agent |
-| `LLM_PROVIDER` / `LLM_MODEL` | `google` / `gemini-3.5-flash-lite` | Answer generation (lite: ~1 s, higher free-tier quota) |
+| `LLM_PROVIDER` / `LLM_MODEL` | `google` / `gemini-3.5-flash-lite` | Answer generation and image descriptions |
 | `EMBED_PROVIDER` / `EMBED_MODEL` | `google` / `gemini-embedding-2` | Embeddings |
-| `VECTOR_STORE` | `simple` | `simple` or `qdrant` |
-| `QDRANT_URL` / `QDRANT_API_KEY` | – | Qdrant server; empty = embedded mode in `storage/qdrant` (one process at a time) |
-| `CHUNK_STRATEGY` | `sentence` | `sentence`, `semantic` or `structure` (sections, tables and heading paths) |
-| `STRUCTURE_FALLBACK` / `SEMANTIC_BREAKPOINT_PERCENTILE` | `semantic` / `95` | How `structure` splits files without headings; breakpoint percentile for semantic chunking |
-| `CHUNK_SIZE` / `CHUNK_OVERLAP` | `512` / `64` | Sentence-aware chunking (tokens) |
-| `IMAGE_CAPTIONS` / `MAX_IMAGES_PER_FILE` | `false` / `40` | Describe images with the LLM at ingestion (cached in `storage/captions`) |
-| `INJECTION_DEFENSE` | `off` | `off`, `spotlight` or `full` prompt-injection defence (see Security) |
-| `RETRIEVAL_MODE` | `hybrid` | `vector`, `bm25`, `hybrid` |
-| `CANDIDATE_TOP_K` / `TOP_K` / `RRF_K` | `8` / `4` / `60` | Retrieval breadth and fusion constant |
-| `MIN_SIMILARITY` | `0.55` | Similarity gate before calling the LLM (calibrated for `gemini-embedding-2`) |
+| `ADK_MODEL` | `gemini-3.5-flash-lite` | Model of the agent |
+| `VECTOR_STORE` | `simple` | `simple` (JSON, zero setup) or `qdrant` |
+| `QDRANT_URL` / `QDRANT_API_KEY` | – | Qdrant server; empty means embedded mode in `storage/qdrant` (one process at a time) |
+| `CHUNK_STRATEGY` | `sentence` | `sentence`, `semantic` or `structure` (recommended) |
+| `STRUCTURE_FALLBACK` | `semantic` | How `structure` splits files without headings: `semantic` or `sentence` |
+| `CHUNK_SIZE` / `CHUNK_OVERLAP` | `512` / `64` | Chunk size in tokens |
+| `IMAGE_CAPTIONS` / `MAX_IMAGES_PER_FILE` | `false` / `40` | Describe images at ingestion (cached in `storage/captions`) |
+| `RETRIEVAL_MODE` | `hybrid` | `vector`, `bm25` or `hybrid` |
+| `CANDIDATE_TOP_K` / `TOP_K` / `RRF_K` | `8` / `4` / `60` | Candidates per retriever, chunks given to the LLM, fusion constant |
+| `MIN_SIMILARITY` | `0.55` | Similarity gate before the LLM is called (calibrated for `gemini-embedding-2`) |
+| `INJECTION_DEFENSE` | `off` | `off`, `spotlight` or `full` |
+| `AGENT_MAX_LLM_CALLS` | `15` | LLM-call limit per agent turn |
 | `AUTO_SYNC` | `true` | Sync the data folder when a process first loads the index |
 | `DOCQA_API_KEY` | – | Protects write endpoints when set |
+
+Changing the embedding model or any chunking setting triggers an automatic index rebuild.
 
 ## API
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/health`, `/stats` | Liveness, index statistics |
+| `GET` | `/health`, `/stats` | Liveness and index statistics |
 | `POST` | `/query` | `{question}` → `{status, answer, sources[], reason, latency_ms}` |
-| `POST` | `/chat` | `{message, session_id?}` → agentic answer, cited sources, the **steps** taken (tool, arguments, result) and the number of LLM calls; keeps conversation per session |
+| `POST` | `/chat` | `{message, session_id?}` → agent answer, sources, the steps taken (tool, arguments, result) and the number of LLM calls; keeps the conversation per session |
 | `GET` | `/documents` | Indexed documents |
-| `POST` | `/documents` | Upload a file (multipart) and index it * |
-| `DELETE` | `/documents/{path}` | Delete a file and remove it from the index * |
-| `POST` | `/index/sync`, `/index/rebuild` | Incremental sync / full rebuild * |
+| `POST` | `/documents` | Upload and index a file \* |
+| `DELETE` | `/documents/{path}` | Delete a file and remove it from the index \* |
+| `POST` | `/index/sync`, `/index/rebuild` | Incremental sync or full rebuild \* |
 
-\* requires `X-API-Key` when `DOCQA_API_KEY` is set. Interactive docs: `http://127.0.0.1:8000/docs`.
+\* Requires the `X-API-Key` header when `DOCQA_API_KEY` is set.
 
-## Tests and linting
+## Development
 
 ```bash
-pytest            # 152 tests, offline: no API key or network needed
+pytest                                    # 152 tests, offline: fake embeddings and LLM, no API key
 ruff check . && ruff format --check .
 ```
 
-The tests cover config parsing, loaders (unreadable/empty/hidden files), RRF maths, hybrid scoring, prompt and refusal handling, and incremental sync (add/update/delete, embedding only changed files). They also cover crash safety (failed rebuild or sync keeps the old index), multi-process reload, the Qdrant backend (sync deletes, rebuild collection rotation, missing-collection recovery), API validation and auth, the ADK tools, multi-turn chat through the real ADK `Runner`, and the evaluator.
-
-## Project structure
+The tests cover parsing and chunking, RRF maths, prompts and refusals, incremental sync and crash safety, the Qdrant backend, the API, the agent tools, multi-turn chat through the real ADK `Runner` driven by a scripted model, the injection defences, and the evaluators.
 
 ```text
-agents/docqa_agent/     ADK entrypoint (root_agent) for `adk web` / `adk run`
 src/docqa/
-  config.py             Settings from env, index fingerprint
-  documents.py          File discovery and loading, stable ids, failure reporting
-  structure.py          Structure-aware parsing: blocks, sections, tables, heading paths
-  images.py             Image extraction, filtering and cached LLM descriptions
-  semantic.py           Semantic chunking (sentence windows, cosine-distance breakpoints)
-  benchmarks.py         Public benchmarks in BEIR format (Zalo Legal), subsets, embedding cache
-  ir_metrics.py         nDCG, MRR, Recall@k, bootstrap confidence intervals
-  chunk_eval.py         Token-level chunking metrics (precision Ω, recall, IoU) on UIT-ViQuAD 2.0
-  injection.py          Prompt-injection defences: sanitiser, spotlighting, output guard, tool gate
-  injection_eval.py     30-case indirect-injection suite and attack-success-rate report
-  ratelimit.py          Quota error detection and provider retry hints
-  retrieval.py          HybridRetriever (vector + BM25 + RRF)
-  prompts.py            Grounded QA prompt, refusal detection, citations
-  storage.py            Versioned atomic persistence (simple / Qdrant)
-  engine.py             DocQAEngine: sync, rebuild, query, file management
-  agent.py              Agentic RAG: instruction (plan/search/judge/verify) and tools
-  chat.py               Multi-turn agent chat: steps, LLM-call limit, citation renumbering
-  api/app.py            FastAPI application
-  evaluation.py         Metrics, calibration and reports
-  cli.py                `docqa` command
-ui/streamlit_app.py     Chat UI
-data/demo/              Fictional company documents (md, txt, docx)
-eval/dataset.jsonl      Labelled evaluation set
-tests/                  Offline test suite with fake models
+  config.py, providers.py     Settings from env, Gemini or Ollama models
+  documents.py                File discovery and loading, stable ids
+  structure.py                Structure-aware parsing: sections, tables, heading paths
+  semantic.py                 Semantic chunking
+  images.py                   Image extraction, filtering and cached descriptions
+  engine.py, storage.py       Ingestion, versioned index, query; quota-aware embedding
+  retrieval.py                HybridRetriever (BM25 + vector + RRF)
+  prompts.py                  Grounded prompt, citations, refusal detection
+  agent.py, chat.py           ADK agent, tools and multi-turn chat with guardrails
+  injection.py                Prompt-injection defences
+  evaluation.py               Own-set evaluation: retrieval, answers, calibration
+  benchmarks.py, ir_metrics.py  BEIR benchmarks (Zalo Legal), nDCG/MRR/Recall, bootstrap CIs
+  chunk_eval.py               Token-level chunking metrics (UIT-ViQuAD 2.0)
+  injection_eval.py           Injection detector and attack-success-rate suite
+  api/app.py, cli.py          FastAPI app, `docqa` command
+agents/docqa_agent/           ADK entry point for `adk web` / `adk run`
+ui/streamlit_app.py           Chat UI
+scripts/                      Benchmark download
+data/demo/                    Fictional company documents
+eval/dataset.jsonl            Labelled demo evaluation set
+docs/                         Architecture and design decisions
 ```
 
-## Limitations and next steps
+## Limitations
 
-- Image descriptions (`IMAGE_CAPTIONS`) cost one LLM call per new image and send images to the LLM provider. Word figures are described only with `CHUNK_STRATEGY=structure` (the plain `.docx` reader has no image positions).
-- PDF structure is not detected yet (PDFs use page-based splitting); headings could be inferred from font sizes or numbering.
-- BM25 tokenizes Vietnamese by syllable and is accent-sensitive. A word segmenter (e.g. underthesea/pyvi) and accent-insensitive matching would improve keyword recall.
-- No reranker yet. A cross-encoder or LLM reranker after RRF is the next quality step to measure with `docqa eval`.
-- The `simple` vector store keeps every vector in memory as JSON (~42 KB per chunk with 3072-dim embeddings) and searches by brute force. Use `VECTOR_STORE=qdrant` with a Qdrant server for larger corpora (HNSW approximate search, on-disk storage).
-- `/chat` sessions are in memory. Use ADK's database session service for persistence across restarts.
-- There are no per-user document permissions: every user can query every indexed document.
+- **Pending measurements:** dense and hybrid retrieval on Zalo Legal, end-to-end attack success rates, and the retrieval gain from image descriptions. `sentence` stays the default chunking strategy until `structure` has also passed a hybrid regression check on the demo set.
+- PDF headings are not detected yet; PDFs are split by page, or semantically with `CHUNK_STRATEGY=structure`.
+- BM25 splits Vietnamese by syllable. A word segmenter (as used in Zalo challenge solutions) is likely to help and can be measured for free on the full Zalo corpus.
+- There is no reranker yet.
+- The Docker Compose file and the GitHub Actions workflow (lint, tests on Python 3.12 and 3.13, Docker build) are included, but the Docker setup has not been verified end to end.
+- `/chat` sessions live in memory, and there are no per-user document permissions.
+- Image descriptions send images to the LLM provider and cost one call per new image.

@@ -397,3 +397,33 @@ def agent_runner(make_engine: Callable[[Settings], Any], model: Any | None = Non
         return Reply(answer=response.answer, tools_run=executed)
 
     return run
+
+
+# ----------------------------------------------------------------------------- detector only
+def evaluate_detector(directory: Path) -> dict[str, dict[str, float]]:
+    """Recall and false-positive rate of the pattern detector on deepset/prompt-injections.
+
+    Patterns were developed on the train split only; the test split is the held-out estimate.
+    """
+    import pyarrow.parquet as pq
+
+    from docqa.injection import detect
+
+    report = {}
+    for split in ("train", "test"):
+        files = sorted((directory / "data").glob(f"{split}-*.parquet"))
+        if not files:
+            continue
+        table = pq.read_table(str(files[0])).to_pydict()
+        rows = list(zip(table["text"], table["label"], strict=True))
+        positives = [text for text, label in rows if label == 1]
+        negatives = [text for text, label in rows if label == 0]
+        report[split] = {
+            "injections": len(positives),
+            "benign": len(negatives),
+            "recall": round(sum(bool(detect(t)) for t in positives) / max(len(positives), 1), 4),
+            "false_positive_rate": round(
+                sum(bool(detect(t)) for t in negatives) / max(len(negatives), 1), 4
+            ),
+        }
+    return report
