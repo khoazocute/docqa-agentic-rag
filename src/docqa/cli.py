@@ -85,6 +85,19 @@ def main(argv: list[str] | None = None) -> int:
     bench.add_argument("--k", type=int, default=100, help="Retrieval depth")
     bench.add_argument("--out", type=Path, default=Path("eval/results"))
 
+    chunk_bench = sub.add_parser(
+        "chunk-bench", help="Token-level chunking evaluation (Chroma metrics) on UIT-ViQuAD 2.0"
+    )
+    chunk_bench.add_argument("parquet", type=Path, help="UIT-ViQuAD 2.0 validation parquet file")
+    chunk_bench.add_argument(
+        "--configs",
+        default="paragraph,128/0,256/0,256/64,512/0,512/64,512/128,1024/0",
+        help="'paragraph' and/or chunk_size/overlap pairs for the sentence splitter",
+    )
+    chunk_bench.add_argument(
+        "--k", type=int, default=5, help="Chunks retrieved (BM25) per question"
+    )
+
     serve = sub.add_parser("serve", help="Run the REST API")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
@@ -101,6 +114,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "bench":
         return _bench(args, parser)
+    if args.command == "chunk-bench":
+        return _chunk_bench(args)
 
     from docqa.engine import get_engine
 
@@ -197,6 +212,44 @@ def _bench(args, parser) -> int:
     )
     print(report)
     print(f"\nReport: {args.out / f'bench-{stamp}.md'}")
+    return 0
+
+
+def _chunk_bench(args) -> int:
+    """Precision Ω (no retriever) and BM25 recall/precision/IoU@k per chunking configuration."""
+    from llama_index.core.node_parser import SentenceSplitter
+
+    from docqa.chunk_eval import (
+        TokenCounter,
+        bm25_retriever,
+        chunk_with,
+        evaluate_chunks,
+        load_viquad,
+        paragraph_chunks,
+    )
+
+    bench = load_viquad(args.parquet)
+    count = TokenCounter()
+    k = args.k
+    print(
+        f"{bench.name}: {len(bench.documents)} articles, {len(bench.excerpts)} labelled excerpts\n"
+    )
+    print(
+        f"| Chunking | Chunks | Tokens/chunk | Precision Ω | Recall@{k} | Precision@{k} | IoU@{k} |"
+    )
+    print("|---|---|---|---|---|---|---|")
+    for config in [c.strip() for c in args.configs.split(",") if c.strip()]:
+        if config == "paragraph":
+            chunks = paragraph_chunks(bench)
+        else:
+            size, overlap = (int(x) for x in config.split("/"))
+            chunks = chunk_with(SentenceSplitter(chunk_size=size, chunk_overlap=overlap), bench)
+            config = f"sentence {config}"
+        r = evaluate_chunks(bench, chunks, bm25_retriever(chunks), k=k, count=count)
+        print(
+            f"| {config} | {r['chunks']} | {r['mean_chunk_tokens']} | {r['precision_omega']:.3f} "
+            f"| {r[f'recall@{k}']:.3f} | {r[f'precision@{k}']:.3f} | {r[f'iou@{k}']:.3f} |"
+        )
     return 0
 
 

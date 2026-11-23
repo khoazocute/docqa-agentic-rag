@@ -79,7 +79,7 @@ More detail: [docs/architecture.md](docs/architecture.md) and [docs/design-decis
 | API | `/query`, `/chat` (multi-turn), `/documents` upload/list/delete, `/index/sync`, `/index/rebuild`, `/stats`, `/health`; optional `X-API-Key` for write endpoints; upload type, size and path-traversal checks |
 | Tooling | CLI, Streamlit UI, Docker Compose, CI (ruff + pytest on Python 3.12/3.13 + Docker build) |
 | Quota handling | Embeddings are sent in batches; per-minute 429s are waited out using the provider's `retry in …` hint, while daily-quota errors fail fast with a clear error |
-| Tests | 117 offline tests with deterministic fake embeddings/LLM, including the real ADK runtime driven by a scripted model |
+| Tests |  offline tests with deterministic fake embeddings/LLM, including the real ADK runtime driven by a scripted model |
 
 ## Quickstart
 
@@ -176,6 +176,30 @@ Each legal article is one passage, as in BEIR, so these numbers measure retrieva
 | BM25 (syllables, Vietnamese stop-words) | 0.628 [0.602–0.654] | 0.562 | 0.417 | 0.757 | 0.834 | 0.968 |
 
 Dense and hybrid retrieval need one embedding per passage, so they are evaluated on a seeded subset: all relevant articles of the sampled queries plus random distractors. Subset scores compare our own configurations and are not comparable with full-corpus results. Passage embeddings are cached on disk, so a run interrupted by a daily quota resumes without re-embedding.
+
+### Public benchmark: chunking measured at token level (UIT-ViQuAD 2.0)
+
+Hit@k does not penalise irrelevant text inside a chunk. Following Chroma's *Evaluating Chunking Strategies for Retrieval* (2024), chunking is also measured token by token against human-labelled spans. Data: the UIT-ViQuAD 2.0 validation split (VLSP 2021; mirror `taidng/UIT-ViQuAD2.0`; the test split has no public answers). The 19 Wikipedia articles are rebuilt from their paragraphs, and the ground-truth excerpt of each of the 2,653 answerable questions is the sentence containing its annotated answer.
+
+```bash
+docqa chunk-bench data/benchmarks/viquad2/data/validation-00000-of-00001.parquet
+```
+
+| Chunking | Chunks | Tokens/chunk | Precision Ω | Recall@5 (BM25) | IoU@5 |
+|---|---|---|---|---|---|
+| **paragraph boundaries** | 557 | 365 | **0.222** | **0.918** | 0.038 |
+| sentence 128 / overlap 0 | 2,121 | 96 | 0.705 | 0.767 | 0.117 |
+| sentence 256 / 0 | 961 | 212 | 0.360 | 0.858 | 0.062 |
+| sentence 256 / 64 | 1,086 | 211 | 0.345 | 0.866 | 0.062 |
+| sentence 512 / 0 | 443 | 459 | 0.167 | 0.901 | 0.030 |
+| sentence 512 / 64 (previous default) | 468 | 457 | 0.165 | 0.909 | 0.030 |
+| sentence 512 / 128 | 539 | 459 | 0.152 | 0.910 | 0.030 |
+| sentence 1024 / 0 | 219 | 929 | 0.083 | 0.924 | 0.015 |
+
+- **Natural boundaries beat fixed-size splitting on both axes.** Paragraph chunks are smaller than 512-token chunks yet have higher recall (0.918 vs 0.909) and higher Precision Ω (0.222 vs 0.165). This is public-data evidence for splitting on the document's own boundaries, the idea behind structure-aware chunking.
+- **Overlap barely helps.** Going from 512/0 to 512/128 adds 22% more chunks for +0.9 points of recall and lowers Precision Ω, consistent with Chroma's findings.
+- **Size is a trade-off, not an optimum.** Small chunks maximise precision and IoU, large ones maximise recall. IoU is read together with recall and answer quality, because tiny chunks starve the LLM of context.
+- Wikipedia text has paragraphs but no headings, so this benchmark cannot compare heading-based structure-aware chunking; the own evaluation set below covers that, plus tables, figures and Word/PDF parsing.
 
 ### Own evaluation set
 
@@ -291,7 +315,7 @@ All settings come from environment variables or `.env` (see [.env.example](.env.
 ## Tests and linting
 
 ```bash
-pytest            # 117 tests, offline: no API key or network needed
+pytest            #  tests, offline: no API key or network needed
 ruff check . && ruff format --check .
 ```
 
@@ -309,6 +333,7 @@ src/docqa/
   semantic.py           Semantic chunking (sentence windows, cosine-distance breakpoints)
   benchmarks.py         Public benchmarks in BEIR format (Zalo Legal), subsets, embedding cache
   ir_metrics.py         nDCG, MRR, Recall@k, bootstrap confidence intervals
+  chunk_eval.py         Token-level chunking metrics (precision Ω, recall, IoU) on UIT-ViQuAD 2.0
   ratelimit.py          Quota error detection and provider retry hints
   retrieval.py          HybridRetriever (vector + BM25 + RRF)
   prompts.py            Grounded QA prompt, refusal detection, citations
