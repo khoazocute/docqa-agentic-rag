@@ -79,7 +79,7 @@ More detail: [docs/architecture.md](docs/architecture.md) and [docs/design-decis
 | API | `/query`, `/chat` (multi-turn), `/documents` upload/list/delete, `/index/sync`, `/index/rebuild`, `/stats`, `/health`; optional `X-API-Key` for write endpoints; upload type, size and path-traversal checks |
 | Tooling | CLI, Streamlit UI, Docker Compose, CI (ruff + pytest on Python 3.12/3.13 + Docker build) |
 | Quota handling | Embeddings are sent in batches; per-minute 429s are waited out using the provider's `retry in …` hint, while daily-quota errors fail fast with a clear error |
-| Tests |  offline tests with deterministic fake embeddings/LLM, including the real ADK runtime driven by a scripted model |
+| Tests | 124 offline tests with deterministic fake embeddings/LLM, including the real ADK runtime driven by a scripted model |
 
 ## Quickstart
 
@@ -315,7 +315,7 @@ All settings come from environment variables or `.env` (see [.env.example](.env.
 ## Tests and linting
 
 ```bash
-pytest            #  tests, offline: no API key or network needed
+pytest            # 124 tests, offline: no API key or network needed
 ruff check . && ruff format --check .
 ```
 
