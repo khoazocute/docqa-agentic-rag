@@ -1,4 +1,5 @@
 # DocQA: Agentic RAG for Vietnamese documents
+n[![CI](https://github.com/khoazocute/docqa-agentic-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/khoazocute/docqa-agentic-rag/actions/workflows/ci.yml)
 
 DocQA answers questions about a folder of documents (PDF, Word, Markdown, text) **in Vietnamese, with citations**, and says *"Tôi không tìm thấy thông tin này trong tài liệu đã cung cấp."* when the documents do not contain the answer.
 
@@ -280,6 +281,6 @@ docs/                         Architecture and design decisions
 - PDF headings are not detected yet; PDFs are split by page, or semantically with `CHUNK_STRATEGY=structure`.
 - BM25 splits Vietnamese by syllable. A word segmenter (as used in Zalo challenge solutions) is likely to help and can be measured for free on the full Zalo corpus.
 - There is no reranker yet.
-- The Docker Compose file and the GitHub Actions workflow (lint, tests on Python 3.12 and 3.13, Docker build) are included, but the Docker setup has not been verified end to end.
+- CI runs lint, the tests on Python 3.12 and 3.13, and a Docker image build on every push. The full Docker Compose stack (Qdrant, API, UI) has not been run end to end yet.
 - `/chat` sessions live in memory, and there are no per-user document permissions.
 - Image descriptions send images to the LLM provider and cost one call per new image.
