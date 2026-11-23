@@ -4,12 +4,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     DATA_DIR=/app/data \
-    STORAGE_DIR=/app/storage
+    STORAGE_DIR=/app/storage \
+    NLTK_DATA=/app/nltk_data
 
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install -r requirements.txt
+# Sentence-tokenizer data for the splitters, in a directory only its owner can write: NLTK
+# refuses data from shared writable locations, and the container must not download at runtime.
+RUN python -m nltk.downloader -q -d /app/nltk_data stopwords punkt_tab
 
 COPY pyproject.toml README.md ./
 COPY src ./src

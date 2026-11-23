@@ -222,6 +222,7 @@ All settings come from environment variables or `.env`; see [.env.example](.env.
 | `AGENT_MAX_LLM_CALLS` | `15` | LLM-call limit per agent turn |
 | `AUTO_SYNC` | `true` | Sync the data folder when a process first loads the index |
 | `DOCQA_API_KEY` | – | Protects write endpoints when set |
+| `NLTK_DATA` | – | Private folder for the sentence-tokenizer data. NLTK refuses data from directories other accounts can write, such as a shared `site-packages`; Docker and CI set it and pre-download `stopwords` and `punkt_tab` |
 
 Changing the embedding model or any chunking setting triggers an automatic index rebuild.
 
