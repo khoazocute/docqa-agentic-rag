@@ -1,0 +1,25 @@
+# Pinned, tested versions (Python 3.13, Nov 2026). For development use: pip install -e ".[dev]"
+# Core
+google-adk==2.4.0
+llama-index-core==0.14.23
+llama-index-llms-google-genai==0.9.6
+llama-index-embeddings-google-genai==0.5.1
+llama-index-readers-file==0.6.0
+llama-index-retrievers-bm25==0.9.0
+pypdf==6.14.2
+docx2txt==0.9
+python-docx==1.2.0
+python-dotenv==1.2.2
+pydantic==2.14.4
+fastapi==0.139.0
+uvicorn[standard]==0.51.0
+python-multipart==0.0.32
+httpx==0.28.1
+# UI
+streamlit==1.67.0
+# Optional: local models (LLM_PROVIDER/EMBED_PROVIDER=ollama)
+llama-index-llms-ollama==0.10.1
+llama-index-embeddings-ollama==0.9.0
+# Optional: VECTOR_STORE=qdrant
+qdrant-client==1.20.0
+llama-index-vector-stores-qdrant==0.11.0

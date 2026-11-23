@@ -1,0 +1,37 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# Secrets
+.env
+
+# Generated index (rebuild with `docqa rebuild`)
+storage/*
+!storage/.gitkeep
+
+# Local documents: only the fictional demo set is versioned
+data/*
+!data/demo/
+data/demo/uploads/
+
+# ADK local session databases (chat history)
+.adk/
+**/.adk/
+
+# Evaluation outputs (commit selected reports manually if desired)
+eval/results/
+
+# Scratch
+review_pdf_text.txt
+
+# Eval sets built on private or third-party documents
+eval/private/
+
+# Third-party material used for local evaluation only (copyrighted)
+docs/RAG.pdf

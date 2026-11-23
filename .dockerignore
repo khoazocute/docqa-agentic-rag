@@ -1,0 +1,13 @@
+.venv
+.git
+.env
+**/__pycache__
+**/.adk
+.pytest_cache
+.ruff_cache
+storage
+eval/results
+review_pdf_text.txt
+data/*
+!data/demo
+data/demo/uploads

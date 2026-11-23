@@ -1,0 +1,11 @@
+QUY ĐỊNH THỰC TẬP MẪU
+
+Thời gian thực tập Sinh viên thực tập từ thứ Hai đến thứ Sáu, bắt đầu lúc 8:30 và kết thúc lúc 17:30.
+
+Báo cáo công việc Mỗi sinh viên cần cập nhật tiến độ công việc hằng ngày vào cuối buổi. Báo cáo cần nêu rõ việc đã làm, khó khăn gặp phải và kế hoạch cho ngày tiếp theo.
+
+Bảo mật thông tin Sinh viên không được chia sẻ tài liệu nội bộ, mã nguồn, dữ liệu khách hàng hoặc thông tin dự án ra bên ngoài.
+
+Đánh giá kết quả Kết quả thực tập được đánh giá dựa trên thái độ làm việc, khả năng hoàn thành nhiệm vụ, tinh thần học hỏi, kỹ năng làm việc nhóm và chất lượng sản phẩm cuối cùng.
+
+Hỗ trợ kỹ thuật Khi gặp lỗi kỹ thuật, sinh viên cần ghi lại thông tin lỗi, ảnh chụp màn hình nếu có, các bước đã thực hiện và gửi cho mentor.
