@@ -19,10 +19,13 @@ from llama_index.core.schema import BaseNode, Document, MetadataMode
 from docqa.config import NOT_FOUND_MESSAGE, SUPPORTED_EXTENSIONS, Settings
 from docqa.documents import LoadResult, load_directory
 from docqa.images import Captioner, CaptionService, llm_captioner
+from docqa.injection import leaks_instructions, sanitize, strip_unknown_links
 from docqa.prompts import (
+    QA_PROMPT,
     VERIFY_PROMPT,
     build_qa_prompt,
     cited_passage_ids,
+    excerpt_text,
     extract_citations,
     format_passages_for_check,
     is_not_found_answer,
@@ -438,6 +441,8 @@ class DocQAEngine:
         meta = node.metadata or {}
         page = meta.get("page_label")
         text = node.get_content().strip()
+        if self.settings.injection_defense == "full":
+            text = sanitize(text).text  # the agent never sees sentences addressing the AI
         if len(text) > PASSAGE_MAX_CHARS:
             text = text[: PASSAGE_MAX_CHARS - 1].rstrip() + "…"
         return Passage(
@@ -604,13 +609,20 @@ class DocQAEngine:
             return self._not_found("low_similarity", latency)
 
         generation_start = time.perf_counter()
-        prompt = build_qa_prompt(question, result.chunks)
+        defense = self.settings.injection_defense
+        prompt = build_qa_prompt(question, result.chunks, defense=defense)
         answer = self.llm.complete(prompt).text.strip()
         latency["generation"] = _elapsed_ms(generation_start)
         latency["total"] = _elapsed_ms(total_start)
 
         if not answer or is_not_found_answer(answer):
             return self._not_found("answer_not_in_context", latency)
+        if defense != "off":
+            visible = [excerpt_text(c, defense) for c in result.chunks]
+            answer, _ = strip_unknown_links(answer, visible)
+            if leaks_instructions(answer, [QA_PROMPT.template.replace(NOT_FOUND_MESSAGE, "")]):
+                logger.warning("Answer withheld: it reproduces the system instructions")
+                return self._not_found("injection_guard", latency)
 
         cited = extract_citations(answer, max_id=len(result.chunks))
         sources = [

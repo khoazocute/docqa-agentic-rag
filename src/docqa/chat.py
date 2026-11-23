@@ -22,8 +22,9 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
-from docqa.agent import build_agent
+from docqa.agent import INSTRUCTION, SECURITY_NOTE, build_agent
 from docqa.config import NOT_FOUND_MESSAGE, Settings
+from docqa.injection import GUARD_MESSAGE, leaks_instructions, strip_unknown_links
 from docqa.prompts import PASSAGE_CITATION_RE, expand_citation_groups, snippet
 from docqa.schemas import AgentStep, ChatResponse, Source
 
@@ -150,6 +151,16 @@ class ChatService:
             # either a paraphrased refusal or an unsupported claim; both become the standard refusal.
             logger.info("Uncited answer replaced by the not-found message: %r", answer[:120])
             answer = NOT_FOUND_MESSAGE
+        if self._settings.injection_defense != "off" and answer not in (
+            LIMIT_MESSAGE,
+            NOT_FOUND_MESSAGE,
+        ):
+            # Output guard: no links the excerpts did not contain, no copy of the instructions.
+            answer, _ = strip_unknown_links(answer, [p.get("text", "") for p in passages.values()])
+            instructions = (INSTRUCTION + SECURITY_NOTE).replace(NOT_FOUND_MESSAGE, "")
+            if leaks_instructions(answer, [instructions]):
+                logger.warning("Agent answer withheld: it reproduces the system instructions")
+                answer, sources = GUARD_MESSAGE, []
         for step in steps:  # keep long arguments (draft answers) readable in the UI and logs
             step.args = {
                 k: (v if len(json.dumps(v, ensure_ascii=False)) < 300 else "…")

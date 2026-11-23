@@ -79,7 +79,7 @@ More detail: [docs/architecture.md](docs/architecture.md) and [docs/design-decis
 | API | `/query`, `/chat` (multi-turn), `/documents` upload/list/delete, `/index/sync`, `/index/rebuild`, `/stats`, `/health`; optional `X-API-Key` for write endpoints; upload type, size and path-traversal checks |
 | Tooling | CLI, Streamlit UI, Docker Compose, CI (ruff + pytest on Python 3.12/3.13 + Docker build) |
 | Quota handling | Embeddings are sent in batches; per-minute 429s are waited out using the provider's `retry in …` hint, while daily-quota errors fail fast with a clear error |
-| Tests | 124 offline tests with deterministic fake embeddings/LLM, including the real ADK runtime driven by a scripted model |
+| Tests | 152 offline tests with deterministic fake embeddings/LLM, including the real ADK runtime driven by a scripted model |
 
 ## Quickstart
 
@@ -277,6 +277,32 @@ What the numbers say:
 
 Remaining single-hop answer metrics need ~34 more LLM calls: `docqa eval --kinds single --delay 4`.
 
+## Security: indirect prompt injection
+
+A document that says "ignore your instructions and …" ends up in the model's context like any other excerpt, and with an agent it can also try to trigger tools. `INJECTION_DEFENSE` adds four independent layers, none of which costs an extra model call:
+
+| Layer | What it does | Level |
+|---|---|---|
+| Spotlighting (Microsoft, 2024) | Excerpts are wrapped in tags with a random per-request nonce; the prompt says tagged text is data only, and forged closing tags are stripped | `spotlight`, `full` |
+| Output guard | Links absent from the excerpts are removed; an answer that reproduces the system instructions is withheld | `spotlight`, `full` |
+| Tool permission | `sync_documents` (state-changing) runs only when the user's own message asks for it, checked in code from ADK's `user_content` | `spotlight`, `full` |
+| Sanitisation | Sentences that address the AI or try to override it (Vietnamese and English pattern families: override, context reset, document bypass, role tags, prompt extraction, tool calls, role play) are replaced with a placeholder before the model sees them | `full` |
+
+**The pattern layer is measured on data it was not written for**, because detection rates on one's own attacks are optimistic:
+
+| Data | Detection (recall) | False positives |
+|---|---|---|
+| [deepset/prompt-injections](https://huggingface.co/datasets/deepset/prompt-injections) test split (60 injections, 56 benign; held out while developing) | **26.7%** | **0%** |
+| 718,149 sentences of clean Vietnamese text (Zalo Legal 61k articles, ViQuAD, demo and private corpora) | – | **0.0003%** (2 sentences) |
+
+The first version flagged ordinary Vietnamese ("đóng vai trò", "sử dụng công cụ hỗ trợ", "ai phải nộp thuế") and caught 1.7% of the held-out injections. It is now very precise but catches only about a quarter of unseen attacks, so the structural layers (spotlighting, output guard, tool permission), which do not depend on recognising the attack, carry most of the defence.
+
+End-to-end attack success rate is measured with a 30-case indirect-injection suite (6 payload types following BIPIA and AgentDojo: instruction override, phishing link, false claim, prompt extraction, tool hijacking, denial of service; 5 placements and disguises each), comparing `off`, `spotlight` and `full` for one-shot RAG and the agent, together with accuracy under attack and on clean documents:
+
+```bash
+docqa injection-eval --modes oneshot,agent --defenses off,spotlight,full --delay 4
+```
+
 ## Configuration
 
 All settings come from environment variables or `.env` (see [.env.example](.env.example)).
@@ -292,6 +318,7 @@ All settings come from environment variables or `.env` (see [.env.example](.env.
 | `STRUCTURE_FALLBACK` / `SEMANTIC_BREAKPOINT_PERCENTILE` | `semantic` / `95` | How `structure` splits files without headings; breakpoint percentile for semantic chunking |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `512` / `64` | Sentence-aware chunking (tokens) |
 | `IMAGE_CAPTIONS` / `MAX_IMAGES_PER_FILE` | `false` / `40` | Describe images with the LLM at ingestion (cached in `storage/captions`) |
+| `INJECTION_DEFENSE` | `off` | `off`, `spotlight` or `full` prompt-injection defence (see Security) |
 | `RETRIEVAL_MODE` | `hybrid` | `vector`, `bm25`, `hybrid` |
 | `CANDIDATE_TOP_K` / `TOP_K` / `RRF_K` | `8` / `4` / `60` | Retrieval breadth and fusion constant |
 | `MIN_SIMILARITY` | `0.55` | Similarity gate before calling the LLM (calibrated for `gemini-embedding-2`) |
@@ -315,7 +342,7 @@ All settings come from environment variables or `.env` (see [.env.example](.env.
 ## Tests and linting
 
 ```bash
-pytest            # 124 tests, offline: no API key or network needed
+pytest            # 152 tests, offline: no API key or network needed
 ruff check . && ruff format --check .
 ```
 
@@ -334,6 +361,8 @@ src/docqa/
   benchmarks.py         Public benchmarks in BEIR format (Zalo Legal), subsets, embedding cache
   ir_metrics.py         nDCG, MRR, Recall@k, bootstrap confidence intervals
   chunk_eval.py         Token-level chunking metrics (precision Ω, recall, IoU) on UIT-ViQuAD 2.0
+  injection.py          Prompt-injection defences: sanitiser, spotlighting, output guard, tool gate
+  injection_eval.py     30-case indirect-injection suite and attack-success-rate report
   ratelimit.py          Quota error detection and provider retry hints
   retrieval.py          HybridRetriever (vector + BM25 + RRF)
   prompts.py            Grounded QA prompt, refusal detection, citations

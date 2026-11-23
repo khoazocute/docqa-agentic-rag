@@ -23,6 +23,9 @@ RETRIEVAL_MODES = ("vector", "bm25", "hybrid")
 CHUNK_STRATEGIES = ("sentence", "semantic", "structure")
 # How structure-aware chunking splits files that have no headings/tables.
 STRUCTURE_FALLBACKS = ("semantic", "sentence")
+# Prompt-injection defence: off | spotlight (delimit excerpts, guard output, gate tools)
+# | full (spotlight + remove sentences that address the AI). See docqa.injection.
+INJECTION_DEFENSES = ("off", "spotlight", "full")
 
 
 def _env_str(name: str, default: str) -> str:
@@ -104,6 +107,9 @@ class Settings:
     rrf_k: int = 60
     min_similarity: float = 0.55
 
+    # Security
+    injection_defense: str = "off"
+
     # Behaviour
     auto_sync: bool = True
     max_upload_mb: int = 20
@@ -139,6 +145,7 @@ class Settings:
             top_k=_env_int("TOP_K", 4, minimum=1),
             rrf_k=_env_int("RRF_K", 60, minimum=1),
             min_similarity=_env_float("MIN_SIMILARITY", 0.55),
+            injection_defense=_env_choice("INJECTION_DEFENSE", "off", INJECTION_DEFENSES),
             auto_sync=_env_bool("AUTO_SYNC", True),
             max_upload_mb=_env_int("MAX_UPLOAD_MB", 20, minimum=1),
             api_key=os.getenv("DOCQA_API_KEY") or None,

@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from llama_index.core import PromptTemplate
 
 from docqa.config import NOT_FOUND_MESSAGE
+from docqa.injection import new_nonce, sanitize, spotlight, spotlight_rule
 from docqa.retrieval import RetrievedChunk
 
 QA_PROMPT = PromptTemplate(
@@ -35,7 +36,13 @@ QA_PROMPT = PromptTemplate(
 _CITATION_RE = re.compile(r"\[(\d{1,2})\]")
 
 
-def format_context(chunks: Sequence[RetrievedChunk]) -> str:
+def excerpt_text(chunk: RetrievedChunk, defense: str = "off") -> str:
+    """The excerpt text the model will see (sentences addressing the AI removed in "full")."""
+    text = chunk.text.strip()
+    return sanitize(text).text if defense == "full" else text
+
+
+def format_context(chunks: Sequence[RetrievedChunk], defense: str = "off", nonce: str = "") -> str:
     blocks = []
     for number, chunk in enumerate(chunks, start=1):
         location = chunk.source
@@ -43,13 +50,20 @@ def format_context(chunks: Sequence[RetrievedChunk]) -> str:
             location += f", trang {chunk.page}"
         if chunk.section:
             location += f", mục {chunk.section}"
-        blocks.append(f"[{number}] (nguồn: {location})\n{chunk.text.strip()}")
-    return "\n\n".join(blocks)
+        text = excerpt_text(chunk, defense)
+        if defense != "off":
+            text = spotlight(text, nonce)
+        blocks.append(f"[{number}] (nguồn: {location})\n{text}")
+    context = "\n\n".join(blocks)
+    if defense != "off":
+        context = spotlight_rule(nonce) + "\n\n" + context
+    return context
 
 
-def build_qa_prompt(question: str, chunks: Sequence[RetrievedChunk]) -> str:
+def build_qa_prompt(question: str, chunks: Sequence[RetrievedChunk], defense: str = "off") -> str:
+    nonce = new_nonce() if defense != "off" else ""
     return QA_PROMPT.format(
-        context=format_context(chunks),
+        context=format_context(chunks, defense, nonce),
         question=question.strip(),
         not_found=NOT_FOUND_MESSAGE,
     )

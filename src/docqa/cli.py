@@ -98,6 +98,15 @@ def main(argv: list[str] | None = None) -> int:
         "--k", type=int, default=5, help="Chunks retrieved (BM25) per question"
     )
 
+    inj = sub.add_parser(
+        "injection-eval", help="Indirect prompt-injection suite: attack success rate per defence"
+    )
+    inj.add_argument("--modes", default="oneshot", help="oneshot and/or agent (comma-separated)")
+    inj.add_argument("--defenses", default="off,spotlight,full", help="Defence levels to compare")
+    inj.add_argument("--payloads", default="", help="Only these payload types (default: all)")
+    inj.add_argument("--delay", type=float, default=0.0, help="Seconds between calls (rate limits)")
+    inj.add_argument("--out", type=Path, default=Path("eval/results"))
+
     serve = sub.add_parser("serve", help="Run the REST API")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
@@ -116,6 +125,8 @@ def main(argv: list[str] | None = None) -> int:
         return _bench(args, parser)
     if args.command == "chunk-bench":
         return _chunk_bench(args)
+    if args.command == "injection-eval":
+        return _injection_eval(args, parser)
 
     from docqa.engine import get_engine
 
@@ -212,6 +223,54 @@ def _bench(args, parser) -> int:
     )
     print(report)
     print(f"\nReport: {args.out / f'bench-{stamp}.md'}")
+    return 0
+
+
+def _injection_eval(args, parser) -> int:
+    """Run the 30-case indirect-injection suite against one-shot RAG and/or the agent."""
+    from docqa.config import INJECTION_DEFENSES, Settings
+    from docqa.engine import DocQAEngine
+    from docqa.injection_eval import (
+        PAYLOADS,
+        agent_runner,
+        build_cases,
+        oneshot_runner,
+        run_cases,
+        summarize,
+        to_markdown,
+        write_report,
+    )
+
+    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    defenses = [d.strip() for d in args.defenses.split(",") if d.strip()]
+    payloads = [p.strip() for p in args.payloads.split(",") if p.strip()]
+    if set(modes) - {"oneshot", "agent"}:
+        parser.error("modes: oneshot, agent")
+    if set(defenses) - set(INJECTION_DEFENSES) or set(payloads) - set(PAYLOADS):
+        parser.error(f"defenses: {INJECTION_DEFENSES}; payloads: {sorted(PAYLOADS)}")
+
+    base = Settings.from_env().with_overrides(auto_sync=False)
+    shared = DocQAEngine(base)  # one LLM/embedding client for every case corpus
+    engines: dict[tuple, DocQAEngine] = {}
+
+    def make_engine(settings: Settings) -> DocQAEngine:
+        key = (str(settings.storage_dir), settings.injection_defense)
+        if key not in engines:
+            engines[key] = DocQAEngine(settings, llm=shared.llm, embed_model=shared.embed_model)
+        return engines[key]
+
+    runners = {"oneshot": oneshot_runner(make_engine), "agent": agent_runner(make_engine)}
+    cases = [c for c in build_cases() if not payloads or c.payload in payloads]
+    rows = run_cases(
+        base,
+        {m: runners[m] for m in modes},
+        defenses,
+        workdir=base.storage_dir / "injection_eval",
+        delay=args.delay,
+        cases=cases,
+    )
+    print(to_markdown(summarize(rows)))
+    print(f"\nReport: {write_report(rows, args.out)}")
     return 0
 
 

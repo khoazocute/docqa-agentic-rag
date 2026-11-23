@@ -134,3 +134,14 @@ The broader lesson is that unit tests with fake models proved the plumbing, but 
   - After cutting at the 95th percentile of consecutive-window cosine distance, oversized groups are re-split with the sentence splitter and tiny ones merged, never above the chunk size. A test caught the first version producing a 103-token chunk under an 80-token limit while carrying a tiny piece forward.
   - Texts with more than 1,500 sentences fall back to sentence splitting.
 - **Status.** `CHUNK_STRATEGY=semantic` exists so the three strategies can be compared on the same tagged benchmark; the comparison is pending embedding quota.
+
+## 16. Prompt injection: structural defences first, patterns measured on someone else's attacks
+
+- **Threat.** Indexed documents are untrusted. In RAG an injected sentence ("ignore your instructions and …") reaches the model as context; in the agent it can also ask for tool calls. Categories follow BIPIA (indirect injection in retrieved content) and AgentDojo (tool-using agents).
+- **Four layers, no extra model call** (`INJECTION_DEFENSE=off|spotlight|full`):
+  - spotlighting with a random per-request nonce, so an attacker cannot close the data tag;
+  - an output guard that removes links absent from the excerpts and withholds answers that reproduce the system instructions;
+  - a code-level permission check on the state-changing `sync_documents` tool, based on the user's own message (ADK `user_content`), not on what the model was told by a document;
+  - pattern sanitisation of sentences addressing the AI.
+- **The pattern layer was evaluated on data it was not developed on.** On deepset/prompt-injections, development used only the train split; the held-out test split gives 26.7% recall with 0% false positives. On 718,149 clean Vietnamese sentences (61k legal articles, Wikipedia, demo and private documents) it flags 0.0003%. The first version flagged everyday Vietnamese ("đóng vai trò", "sử dụng công cụ", "ai phải …" meaning "who must …") and caught 1.7% of held-out attacks, which is why false positives are measured on large clean corpora and recall on external data.
+- **Conclusion drawn from those numbers.** A filter that misses three attacks in four cannot be the main defence. The structural layers do not depend on recognising an attack, and they carry most of the weight; the filter is a cheap, high-precision extra. End-to-end attack success rates, with accuracy under attack and on clean documents so a defence cannot win by refusing everything, come from `docqa injection-eval`.
