@@ -1,5 +1,6 @@
 # DocQA: Agentic RAG for Vietnamese documents
-n[![CI](https://github.com/khoazocute/docqa-agentic-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/khoazocute/docqa-agentic-rag/actions/workflows/ci.yml)
+
+[![CI](https://github.com/khoazocute/docqa-agentic-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/khoazocute/docqa-agentic-rag/actions/workflows/ci.yml)
 
 DocQA answers questions about a folder of documents (PDF, Word, Markdown, text) **in Vietnamese, with citations**, and says *"Tôi không tìm thấy thông tin này trong tài liệu đã cung cấp."* when the documents do not contain the answer.
 
