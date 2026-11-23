@@ -9,11 +9,12 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false  # report every Python version instead of cancelling the others
       matrix:
         python-version: ["3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -22,14 +23,23 @@ jobs:
           pip install -r requirements-dev.txt
           pip install --no-deps -e .
       - name: Lint
-        run: ruff check src tests agents ui && ruff format --check src tests agents ui
+        run: ruff check src tests agents ui scripts && ruff format --check src tests agents ui scripts
       - name: Test (offline, no API key needed)
-        run: pytest
+        shell: bash
+        run: |
+          set +e
+          pytest -q -rfE 2>&1 | tee pytest.log
+          status=${PIPESTATUS[0]}
+          # Surface each failure as a public annotation (job logs need sign-in to read).
+          grep -E "^(FAILED|ERROR) " pytest.log | head -10 | while read -r line; do
+            echo "::error title=pytest::${line:0:900}"
+          done
+          exit $status
 
   docker:
     runs-on: ubuntu-latest
     needs: test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build image
         run: docker build -t docqa:ci .
